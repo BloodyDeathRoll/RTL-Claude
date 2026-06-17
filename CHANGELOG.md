@@ -2,7 +2,13 @@
 
 All notable changes to Claude RTL Fix will be documented in this file.
 
-## [1.5.5] — Current
+## [1.6.0] — Current
+
+Added an **EN/HE input-direction toggle** to the message composer. A small button in the composer's control row cycles between two explicit states: **EN** (default, unchanged LTR) and **HE** (the composer renders right-to-left and right-aligned). This is a deliberate two-state toggle rather than auto-detection — `dir="auto"` on the editor flips direction mid-sentence as the first strong character changes while you type, which is jarring for a live input field.
+
+Implementation notes: the direction is applied via a CSS rule keyed off `data-claude-input-dir="he"` on `<html>`, not inline styles on the editor — the composer is a framework-managed (ProseMirror) contenteditable that strips inline styles on re-render. The rule sets both `direction: rtl !important` and `text-align: right !important` because Claude.ai hard-codes a physical `text-align: left` via Tailwind, so direction alone won't right-align. A single `:is()` selector list covers both the new-chat landing composer and the in-thread composer. The choice persists in `chrome.storage.local`, restores on load, and reacts to `storage.onChanged` — mirroring the master on/off toggle. The button is re-injected via the existing `MutationObserver` since the composer can be torn down and swapped, and it respects the master on/off (when the extension is off, the toggle, its styles, and the `<html>` attribute are all removed).
+
+## [1.5.5]
 
 The `<ul>`/`<ol>`/`<dl>` containers now get `padding-right: 2.8rem` so RTL bullets/numbers have room to sit inside the message bubble instead of overflowing to its outer edge. Identified via DevTools inspection — Claude.ai's text blocks use `padding-right: 2rem` and lists use `padding-right: 1.5rem`, leaving no room for the marker to occupy.
 
