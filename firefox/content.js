@@ -1,4 +1,4 @@
-// Claude RTL Fix — content script (v1.5.0)
+// Claude RTL Fix — content script (v1.6.1)
 //
 // Two-pass fix for RTL text on Claude.ai:
 //
@@ -67,6 +67,13 @@
   // Long enough that streaming bursts don't flicker; short enough that the
   // fix appears responsive once Claude pauses.
   const CONTAINER_DEBOUNCE_MS = 150;
+  // Hard ceiling on the debounce: claude.ai mutates the DOM continuously
+  // (streaming indicators, timers, UI), and a pure "reset on every mutation"
+  // debounce can be starved forever — the container scan would never run, so
+  // pass-2 direction (the only thing that fixes Latin-first RTL lists) would
+  // never apply. Once we've been waiting this long, force the scan even if
+  // mutations are still arriving.
+  const CONTAINER_MAX_WAIT_MS = 600;
 
   // Cross-browser shims
   const storage = (typeof browser !== 'undefined' && browser.storage)
@@ -113,12 +120,51 @@
     return null;
   }
 
+  // Dominant direction: counts strong RTL vs LTR characters and returns the
+  // majority (ties → rtl). detectDirection() looks only at the FIRST strong
+  // character, which mis-classifies a predominantly-Hebrew block that happens
+  // to start with a Latin token — e.g. a list item beginning "[Unverified] …"
+  // or "**Excel** …" resolves LTR under dir="auto" even though the body is
+  // Hebrew. For block-level layout (list items) we want the body's direction,
+  // not whatever the first word happens to be.
+  function detectDominantDirection(text) {
+    if (!text) return null;
+    const len = Math.min(text.length, 500);
+    let rtl = 0, ltr = 0;
+    for (let i = 0; i < len; i++) {
+      const ch = text[i];
+      if (RTL_REGEX.test(ch)) rtl++;
+      else if (LTR_REGEX.test(ch)) ltr++;
+    }
+    if (rtl === 0 && ltr === 0) return null;
+    return rtl >= ltr ? 'rtl' : 'ltr';
+  }
+
   let enabled = true;
   let observer = null;
-  let inputDir = 'en';   // 'en' | 'he' — composer input direction
+  let inputDir = 'en';   // 'en' | 'he' — language mode (composer + rendering)
+
+  // Block direction resolver. The EN/HE toggle is the source of truth:
+  //
+  //   HE mode → the user has declared the whole conversation Hebrew, so every
+  //   prose block is RTL, full stop. No character counting — a heading like
+  //   "לגבי Claude for Work / Legal Skill:" is mostly Latin by character but is
+  //   semantically Hebrew, and counting can never get that right. Embedded
+  //   English runs still lay out left-to-right within the RTL line via the
+  //   Unicode bidi algorithm. Code is exempt: it's handled by codeDir() and
+  //   stays LTR (real source) or follows its own content.
+  //
+  //   EN mode → fall back to per-block dominant detection (returns null when
+  //   the block has no strong character yet).
+  function resolveDir(text) {
+    if (inputDir === 'he') return 'rtl';
+    return detectDominantDirection(text);
+  }
 
   const dirtyContainers = new Set();
+  const dirtyBlocks = new Set();
   let containerScanTimer = null;
+  let containerScanFirstQueuedAt = 0;
 
   // --- CSS injection ---
   //
@@ -157,6 +203,20 @@
         text-align: start !important;
         list-style-position: outside !important;
       }
+      /* RTL lists/items: FORCE both direction and right-alignment with
+         !important. Setting the dir="rtl" attribute alone is not enough — it
+         only carries the low-specificity UA rule [dir=rtl]{direction:rtl},
+         which Claude's Tailwind direction/text-align classes override, so the
+         number/bullet stays on the left. Same lesson as the code-block and
+         composer rules: direction and text-align must be forced together. The
+         container dir moves the marker column to the right; the per-item dir
+         (set explicitly from each item's dominant direction) keeps a minority
+         LTR item left-aligned because it does NOT match dir="rtl". */
+      ul[dir="rtl"], ol[dir="rtl"], dl[dir="rtl"],
+      li[dir="rtl"], dt[dir="rtl"], dd[dir="rtl"] {
+        direction: rtl !important;
+        text-align: right !important;
+      }
       /* Blockquote: border on the start side regardless of direction */
       blockquote[dir="rtl"] {
         border-inline-start: 3px solid currentColor !important;
@@ -167,7 +227,18 @@
         padding-inline-end: 0 !important;
         opacity: 1 !important;
       }
-      /* Inline code inside RTL text: stays LTR and isolated from bidi */
+      /* Block code (fenced) whose content is RTL: flip it RTL *and* right-align
+         it — both together. direction alone only reorders glyphs; Claude's
+         Tailwind hard-codes a physical text-align, so text-align:right is
+         required to actually move the text to the right edge. Real source code
+         stays dir="ltr" and is unaffected; only Hebrew-content blocks get
+         dir="rtl" set on the <pre>/<code> by codeDir(). */
+      pre[dir="rtl"], pre[dir="rtl"] code, pre code[dir="rtl"] {
+        direction: rtl !important;
+        text-align: right !important;
+      }
+      /* Inline code inside RTL text: stays LTR and isolated from bidi.
+         pre code is excluded so block code keeps its content direction. */
       [dir="rtl"] code:not(pre code), [dir="auto"] code:not(pre code) {
         unicode-bidi: isolate;
         direction: ltr;
@@ -304,6 +375,7 @@
         if (inputDir === dir) return;
         inputDir = dir;
         applyInputDir();
+        rescanAllDirections();   // mode change → re-judge all rendered content
         storage.set({ [INPUT_DIR_KEY]: dir }).catch(() => {});
       });
       return seg;
@@ -424,23 +496,43 @@
     el.setAttribute(MARKER_ATTR, '1');
   }
 
+  // Block code (a <pre> or the <code> inside one) follows its CONTENT
+  // direction: a fenced block of Hebrew prose/pseudo-code right-aligns, while
+  // real source code (overwhelmingly ASCII) resolves to LTR. Inline code in
+  // prose (file paths, identifiers) is NOT inside a <pre> and always stays LTR.
+  function codeDir(el) {
+    if (!el.closest('pre')) return 'ltr';
+    return detectDirection(el.textContent) === 'rtl' ? 'rtl' : 'ltr';
+  }
+
   function fixCodeSync(el) {
     if (el.hasAttribute(MARKER_ATTR)) return;
-    el.setAttribute('dir', 'ltr');
+    el.setAttribute('dir', codeDir(el));
     el.setAttribute(MARKER_ATTR, '1');
   }
 
   function applyBlockFixSync(root) {
     if (!root || !root.querySelectorAll) return;
     const textBlocks = root.querySelectorAll(TEXT_BLOCK_SELECTORS);
-    for (const el of textBlocks) fixBlockSync(el);
-    if (root.matches && root.matches(TEXT_BLOCK_SELECTORS)) fixBlockSync(root);
+    for (const el of textBlocks) { fixBlockSync(el); dirtyBlocks.add(el); }
+    if (root.matches && root.matches(TEXT_BLOCK_SELECTORS)) { fixBlockSync(root); dirtyBlocks.add(root); }
     const codeBlocks = root.querySelectorAll(CODE_SELECTORS);
     for (const el of codeBlocks) fixCodeSync(el);
 
     const containers = root.querySelectorAll(CONTAINER_SELECTORS);
     for (const c of containers) dirtyContainers.add(c);
-    if (root.matches && root.matches(CONTAINER_SELECTORS)) dirtyContainers.add(root);
+    // Re-queue the NEAREST ancestor container/block too (closest includes root
+    // itself). On claude.ai the <ol>/<table>/<p> is inserted before its text
+    // streams in; without this, content arriving inside an existing element
+    // never re-triggers its direction scan, so it's judged once while empty
+    // and never again. This is what left RTL lists and Latin-prefixed Hebrew
+    // paragraphs stuck LTR.
+    if (root.closest) {
+      const ancestor = root.closest(CONTAINER_SELECTORS);
+      if (ancestor) dirtyContainers.add(ancestor);
+      const blockAncestor = root.closest(TEXT_BLOCK_SELECTORS);
+      if (blockAncestor) dirtyBlocks.add(blockAncestor);
+    }
   }
 
   function applyBlockFixChunked(root, onDone) {
@@ -451,12 +543,21 @@
     const textBlocks = Array.from(root.querySelectorAll(TEXT_BLOCK_SELECTORS));
     const codeBlocks = Array.from(root.querySelectorAll(CODE_SELECTORS));
     const containers = Array.from(root.querySelectorAll(CONTAINER_SELECTORS));
+    // Also re-scan the nearest ancestor container/block (closest includes
+    // root), so content streamed into an already-present <ol>/<table>/<p>
+    // re-triggers its direction scan. See applyBlockFixSync for the rationale.
+    if (root.closest) {
+      const ancestor = root.closest(CONTAINER_SELECTORS);
+      if (ancestor) containers.push(ancestor);
+      const blockAncestor = root.closest(TEXT_BLOCK_SELECTORS);
+      if (blockAncestor) textBlocks.push(blockAncestor);
+    }
     const all = textBlocks.concat(codeBlocks);
 
     processInChunks(all, (el) => {
       if (el.hasAttribute(MARKER_ATTR)) return;
       if (CODE_TAGS.has(el.tagName)) {
-        el.setAttribute('dir', 'ltr');
+        el.setAttribute('dir', codeDir(el));
         el.setAttribute(MARKER_ATTR, '1');
       } else {
         if (el.closest(CODE_SELECTORS)) return;
@@ -465,25 +566,43 @@
       }
     }, () => {
       for (const c of containers) dirtyContainers.add(c);
+      for (const b of textBlocks) dirtyBlocks.add(b);
       queueContainerScan();
       if (onDone) onDone();
     });
   }
 
+  // Re-evaluate a single text block's direction from its DOMINANT content
+  // direction and set it explicitly. This is what fixes a Hebrew paragraph
+  // that opens with a Latin token (e.g. "[Certain] …"): dir="auto" would key
+  // off the first strong character ('C') and resolve LTR, but the body is
+  // Hebrew. When the block has no strong character yet (still empty/streaming)
+  // we leave the pass-1 dir="auto" in place and pick it up on a later scan.
+  function processTextBlock(el) {
+    if (!el.isConnected) return;
+    if (el.closest(CODE_SELECTORS)) return;
+    const d = resolveDir(el.textContent);
+    if (d) el.setAttribute('dir', d);
+  }
+
   // --- pass 2: container direction (debounced) ---
   //
-  // Key insight: for LISTS specifically, we don't want to force dir="rtl" on
-  // the whole <ul> because that pins the bullet column to one side regardless
-  // of each item's content direction. Instead we set dir="auto" on the list
-  // itself — the browser then aligns the list block based on its first strong
-  // character, AND each <li dir="auto"> renders its bullet on its own start
-  // side. This gives the correct mixed-direction behavior automatically:
-  // Hebrew items get bullets on the right, English items get bullets on the
-  // left, all within the same list.
+  // Key insight: for LISTS we want each <li> to carry its OWN direction so its
+  // bullet/number sits on its own start side — Hebrew items get markers on the
+  // right, English items on the left, within one list. We used to do this with
+  // dir="auto" and let the browser resolve each item, but dir="auto" keys off
+  // the FIRST strong character: a Hebrew item that opens with a Latin token
+  // (e.g. "[Unverified] …" or "**Excel** …") resolves LTR and renders with its
+  // number on the left. So we now set an EXPLICIT dir on each item from its
+  // DOMINANT direction (majority of strong characters), which reflects the
+  // body rather than the first word. The container's dir follows the item
+  // majority for block alignment, but each item's explicit dir still governs
+  // its own marker side, so a minority LTR item inside an RTL list keeps its
+  // left-side number.
   //
-  // For TABLES and BLOCKQUOTES we still set dir="rtl" explicitly because
-  // their layout (column flow, border side) really does need a single
-  // direction for the whole container.
+  // For TABLES and BLOCKQUOTES we set dir="rtl" explicitly because their
+  // layout (column flow, border side) really does need a single direction for
+  // the whole container.
 
   function setContainerDir(container, dir) {
     if (!dir) return;
@@ -498,21 +617,27 @@
 
     const tag = container.tagName;
 
-    // Lists: set dir="auto" if any child is RTL. Browser handles the rest.
+    // Lists: give each item an explicit dir from its dominant direction, then
+    // align the container to the item majority.
     if (tag === 'UL' || tag === 'OL' || tag === 'DL') {
       const children = tag === 'DL'
         ? container.querySelectorAll(':scope > dt, :scope > dd')
         : container.querySelectorAll(':scope > li');
 
-      let hasRtl = false;
+      let rtlItems = 0, ltrItems = 0;
       for (const child of children) {
-        if (detectDirection(child.textContent) === 'rtl') {
-          hasRtl = true;
-          break;
-        }
+        const d = resolveDir(child.textContent);
+        if (!d) continue;
+        // Explicit per-item dir overrides the dir="auto" set in pass 1, so the
+        // item's marker side follows its body rather than its first character.
+        child.setAttribute('dir', d);
+        if (d === 'rtl') rtlItems++; else ltrItems++;
       }
-      if (hasRtl) {
-        setContainerDir(container, 'auto');
+      if (rtlItems > 0) {
+        // RTL majority → align the whole list right; otherwise keep the block
+        // neutral ("auto") so a lone RTL item doesn't right-shift an English
+        // list. Either way each item keeps its own marker side via its dir.
+        setContainerDir(container, rtlItems >= ltrItems ? 'rtl' : 'auto');
       }
       return;
     }
@@ -522,7 +647,7 @@
       const cells = container.querySelectorAll('td, th');
       let rtl = 0, ltr = 0;
       for (const cell of cells) {
-        const d = detectDirection(cell.textContent);
+        const d = resolveDir(cell.textContent);
         if (d === 'rtl') rtl++;
         else if (d === 'ltr') ltr++;
       }
@@ -544,7 +669,7 @@
       const text = paragraphs.length > 0
         ? Array.from(paragraphs).map(p => p.textContent).join(' ')
         : container.textContent;
-      const dir = detectDirection(text);
+      const dir = resolveDir(text);
       if (dir === 'rtl') {
         setContainerDir(container, 'rtl');
       } else if (dir === 'ltr' && container.getAttribute(CONTAINER_MARKER) === 'rtl') {
@@ -554,24 +679,50 @@
     }
   }
 
-  function queueContainerScan() {
-    if (dirtyContainers.size === 0) return;
-    // Debounce: cancel any pending timer and start a new one. Each new
-    // mutation pushes the scan further out, so we only scan once streaming
-    // has been quiet for CONTAINER_DEBOUNCE_MS.
-    if (containerScanTimer !== null) {
-      clearTimeout(containerScanTimer);
-    }
-    containerScanTimer = setTimeout(() => {
-      containerScanTimer = null;
-      if (!enabled) {
-        dirtyContainers.clear();
-        return;
-      }
-      const containers = Array.from(dirtyContainers);
+  function runContainerScan() {
+    containerScanTimer = null;
+    containerScanFirstQueuedAt = 0;
+    if (!enabled) {
       dirtyContainers.clear();
-      processInChunks(containers, processContainer);
-    }, CONTAINER_DEBOUNCE_MS);
+      dirtyBlocks.clear();
+      return;
+    }
+    const blocks = Array.from(dirtyBlocks);
+    dirtyBlocks.clear();
+    const containers = Array.from(dirtyContainers);
+    dirtyContainers.clear();
+    // Blocks first (per-element direction), then containers (container-level
+    // direction + list/table layout). Order is not strictly required — both
+    // converge to the same per-item dir — but this keeps it predictable.
+    if (blocks.length) processInChunks(blocks, processTextBlock);
+    if (containers.length) processInChunks(containers, processContainer);
+  }
+
+  function queueContainerScan() {
+    if (dirtyContainers.size === 0 && dirtyBlocks.size === 0) return;
+    // Debounce: each new mutation pushes the scan out by CONTAINER_DEBOUNCE_MS
+    // so streaming bursts don't flicker. BUT cap the total wait — if mutations
+    // keep arriving (claude.ai never goes fully quiet), force the scan once
+    // we've waited CONTAINER_MAX_WAIT_MS, so it can't be starved forever.
+    const now = Date.now();
+    if (!containerScanFirstQueuedAt) containerScanFirstQueuedAt = now;
+    if (containerScanTimer !== null) clearTimeout(containerScanTimer);
+    const waited = now - containerScanFirstQueuedAt;
+    const delay = waited >= CONTAINER_MAX_WAIT_MS
+      ? 0
+      : Math.min(CONTAINER_DEBOUNCE_MS, CONTAINER_MAX_WAIT_MS - waited);
+    containerScanTimer = setTimeout(runContainerScan, delay);
+  }
+
+  // Re-evaluate every block and container on the page. Called when the EN/HE
+  // mode flips: HE forces all prose RTL, EN reverts to detection, so already-
+  // rendered content must be re-judged. processTextBlock/processContainer
+  // overwrite the existing dir, so this both applies and reverts cleanly.
+  function rescanAllDirections() {
+    if (!enabled) return;
+    for (const b of document.querySelectorAll(TEXT_BLOCK_SELECTORS)) dirtyBlocks.add(b);
+    for (const c of document.querySelectorAll(CONTAINER_SELECTORS)) dirtyContainers.add(c);
+    queueContainerScan();
   }
 
   // --- removal (chunked) ---
@@ -665,8 +816,10 @@
       clearTimeout(containerScanTimer);
       containerScanTimer = null;
     }
+    containerScanFirstQueuedAt = 0;
     cancelAllJobs();
     dirtyContainers.clear();
+    dirtyBlocks.clear();
     pendingTouched.clear();
     removeFixChunked();
     // Master off → the input-direction toggle does nothing either.
@@ -697,7 +850,10 @@
     }
     if (changes[INPUT_DIR_KEY]) {
       inputDir = changes[INPUT_DIR_KEY].newValue === 'he' ? 'he' : 'en';
-      if (enabled) applyInputDir();
+      if (enabled) {
+        applyInputDir();
+        rescanAllDirections();   // mode change in another tab → re-judge here too
+      }
     }
   });
 })();

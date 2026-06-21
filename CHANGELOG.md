@@ -2,7 +2,23 @@
 
 All notable changes to Claude RTL Fix will be documented in this file.
 
-## [1.6.0] — Current
+## [1.6.1] — Current
+
+Two RTL-detection fixes for content that *starts* with a Latin token but is predominantly Hebrew:
+
+- **Fenced code blocks.** Block code was unconditionally forced to `dir="ltr"`, so a fenced block containing Hebrew prose/pseudo-code rendered left-to-right and left-aligned. Block code (`<pre>` and the `<code>` inside it) now follows its actual content direction via `codeDir()`: strongly-RTL content gets `dir="rtl"`, while genuine source code (overwhelmingly ASCII) still resolves to LTR. Inline code in prose (file paths, identifiers — not inside a `<pre>`) is unchanged and stays LTR-isolated. The accompanying CSS rule sets both `direction: rtl !important` and `text-align: right !important` together, since Claude.ai's Tailwind hard-codes a physical text-align that direction alone won't override.
+
+- **List items.** List direction relied on `dir="auto"`, which keys off the *first* strong character — so a Hebrew item opening with a Latin token (e.g. `[Unverified] …`, `**Excel** …`) resolved LTR and rendered with its bullet/number on the left. Direction is now decided by `detectDominantDirection()` (majority of strong characters) and set explicitly on each item, so a predominantly-Hebrew item flips RTL regardless of its first word. Each item keeps its own direction, so a minority LTR item inside an otherwise-RTL list still gets its marker on the left. The same dominant-direction detection now also drives table-cell and blockquote direction.
+
+Two supporting fixes were needed to make the list change actually take effect on live pages:
+
+- **Container re-scan on streamed content.** claude.ai inserts an `<ol>`/`<table>` *before* its rows/items stream in, so the container's direction was judged once while empty and never re-checked. Any change now also re-queues its nearest ancestor container for a direction re-scan.
+- **Debounce ceiling.** The container scan was debounced and reset on every mutation; because claude.ai mutates continuously, the scan could be starved indefinitely and never run. A `CONTAINER_MAX_WAIT_MS` ceiling now forces the scan even while mutations keep arriving.
+- **Block-level re-scan.** Direction re-evaluation was extended from list/table/blockquote containers to standalone text blocks (paragraphs, headings, cells), so a Latin-prefixed Hebrew paragraph like `[Certain] …` no longer stays LTR.
+
+The EN/HE toggle is now the source of truth for **rendering**, not just the composer. In **HE** mode every prose block is forced RTL via `resolveDir()` — no character counting — so headings that are mostly Latin by character but semantically Hebrew (e.g. `לגבי Claude for Work / Legal Skill:`) render correctly; embedded English runs still lay out LTR within the line via the Unicode bidi algorithm. Code is exempt and stays LTR. **EN** mode keeps the existing auto-detection. Flipping the toggle re-judges all on-screen content live and syncs across tabs.
+
+## [1.6.0]
 
 Added an **EN/HE input-direction toggle** to the message composer. A small button in the composer's control row cycles between two explicit states: **EN** (default, unchanged LTR) and **HE** (the composer renders right-to-left and right-aligned). This is a deliberate two-state toggle rather than auto-detection — `dir="auto"` on the editor flips direction mid-sentence as the first strong character changes while you type, which is jarring for a live input field.
 
